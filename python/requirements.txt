@@ -1,0 +1,4 @@
+# Python 依赖（在你自己有外网的电脑上安装）
+# 建议 Python 3.10 ~ 3.12；安装： pip install -r requirements.txt
+akshare>=1.14.0
+pandas>=2.0
