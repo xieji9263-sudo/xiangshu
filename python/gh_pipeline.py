@@ -46,9 +46,9 @@ def main():
         run("tail_scan", "--force", "--max-cand", "12")
         return
 
-    if 800 <= hm <= 920:
+    if 830 <= hm <= 935:
         run("mood_report")
-    elif 920 <= hm <= 955:
+    elif 920 <= hm <= 1000:
         prev = prev_trading_date_str()
         print(f"[gh_pipeline] auction: 涨停池日期取上一交易日 {prev}", flush=True)
         rc = run("build_limitup_pool", "--date", prev)
@@ -56,7 +56,7 @@ def main():
             print("[gh_pipeline] 涨停池重建失败, 竞价终止", flush=True)
             sys.exit(rc)
         run("auction_scan", "--force")
-    elif 1430 <= hm <= 1500:
+    elif 1350 <= hm <= 1500:
         run("tail_scan", "--force")
     elif 1500 <= hm <= 1540:
         run("build_limitup_pool")
