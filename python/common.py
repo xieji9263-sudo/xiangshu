@@ -257,15 +257,22 @@ def minute_metrics(mdf: pd.DataFrame, cfg_tail: dict, index_mdf: pd.DataFrame = 
     ha = conf.get("high_after", "14:25")
     out["high_after"] = bool(hi_t.strftime("%H:%M") >= ha)
 
-    # --- 阶梯式温和放大: 4 桶每分钟均量 ---
+    # --- 阶梯式温和放大: 4 桶每分钟均量(时钟桶; early=早盘模式按已有时段四分位近似) ---
     vol = m["成交量"].astype(float)
-    buckets = {"early": ("09:30", "10:30"), "mid1": ("10:30", "11:30"),
-               "mid2": ("13:00", "14:00"), "tail": ("14:00", "15:00")}
     per_min = {}
     hm = m["_t"].dt.strftime("%H:%M")
-    for k, (a, b) in buckets.items():
-        seg = vol[(hm >= a) & (hm < b)]
-        per_min[k] = float(seg.mean()) if len(seg) else float("nan")
+    if cfg_tail.get("early"):
+        n = len(vol)
+        edges = [0, n // 4, n // 2, (3 * n) // 4, n]
+        for k, (a, b) in zip(("early", "mid1", "mid2", "tail"), zip(edges[:-1], edges[1:])):
+            seg = vol.iloc[a:b]
+            per_min[k] = float(seg.mean()) if len(seg) else float("nan")
+    else:
+        buckets = {"early": ("09:30", "10:30"), "mid1": ("10:30", "11:30"),
+                   "mid2": ("13:00", "14:00"), "tail": ("14:00", "15:00")}
+        for k, (a, b) in buckets.items():
+            seg = vol[(hm >= a) & (hm < b)]
+            per_min[k] = float(seg.mean()) if len(seg) else float("nan")
     prev_avg = pd.Series([per_min.get("early"), per_min.get("mid1"), per_min.get("mid2")],
                          dtype="float").mean()
     out["per_min_vol"] = {k: (round(v, 1) if v == v else None) for k, v in per_min.items()}
