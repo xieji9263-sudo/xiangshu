@@ -22,6 +22,7 @@ tail_scan —— 14:30 后"一夜持股法"8条件全量扫描（对应通达信
 仅供学习研究, 不构成投资建议。
 """
 import argparse
+import copy
 import datetime as dt
 import os
 import time
@@ -148,12 +149,20 @@ def main():
     # ---- 阶段2: 分钟线复核 ----
     index_df = None if args.no_index else index_minutes()
 
+    # 早盘模式: 提前运行(<14:30, 例如云端 13:58 触发)时, 用已有时段做近似复核
+    cfg_tail = copy.deepcopy(config.TAIL)
+    if now_hm < t0:
+        cfg_tail["early"] = True
+        cfg_tail["confirm"]["high_after"] = "13:30"
+        print(f"[早盘模式] 当前 {now_hm} 早于 {t0}, 按已有时段近似复核(数据截至 {now_hm}); "
+              f"新高判定放宽到 13:30 后")
+
     rows = []
     for i, (_, r) in enumerate(cand.iterrows(), 1):
         code, name = r["代码"], r["名称"]
         try:
             mdf = minute_of(code, r["最高"], r["最低"])
-            met = minute_metrics(mdf, config.TAIL, index_df)
+            met = minute_metrics(mdf, cfg_tail, index_df)
         except Exception as e:  # noqa: BLE001
             print(f"  [警告] {code} {name} 分钟复核失败: {e}")
             continue
