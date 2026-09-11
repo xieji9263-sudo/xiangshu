@@ -365,3 +365,122 @@ def market_mood_block(spot: pd.DataFrame) -> tuple:
     block = (f"上涨 {up} / 下跌 {dn} / 平盘 {flat}, 上涨占比 {red:.0%}\n"
              f"涨停≈{lu}家 / 跌停≈{ld}家")
     return block, verdict
+
+
+def prev_trading_date_str() -> str:
+    """上一交易日(仅跳周末; 节假日取到的日期无涨停池时表现为空池, 属正常)。"""
+    d = dt.date.today()
+    for _ in range(10):
+        d -= dt.timedelta(days=1)
+        if d.weekday() < 5:
+            return d.strftime("%Y%m%d")
+    return d.strftime("%Y%m%d")
+
+
+def trading_elapsed_fraction(now=None) -> float:
+    """当日已交易时间占全天(240分钟)的比例, 用于量能折算。"""
+    now = now or dt.datetime.now()
+    mins = now.hour * 60 + now.minute
+    if mins < 9 * 60 + 30:
+        return 0.0
+    if mins <= 11 * 60 + 30:
+        return (mins - (9 * 60 + 30)) / 240
+    if mins < 13 * 60:
+        return 120 / 240
+    if mins <= 15 * 60:
+        return (120 + (mins - 13 * 60)) / 240
+    return 1.0
+
+
+def market_context(spot: pd.DataFrame, pool: pd.DataFrame = None) -> tuple:
+    """
+    收盘前/午盘的综合分析: 家数+涨停 情绪、两市量能、昨日涨停池晋级与主线强弱。
+    返回 (多行文本列表, 一句话操作建议)。
+    """
+    import config as _cfg
+    lines = []
+    blk, verdict = market_mood_block(spot)
+    lines.append(blk)
+
+    # ---- 量能: 今日两市成交额 vs 昨日两市成交额(东财指数日线) ----
+    amt = pd.to_numeric(spot["成交额"], errors="coerce").sum()
+    elapsed = trading_elapsed_fraction()
+    prev_amt = None
+    try:
+        import providers
+        a1 = providers.index_prev_amount("sh000001")
+        a2 = providers.index_prev_amount("sz399106")
+        if a1 and a2:
+            prev_amt = float(a1) + float(a2)
+    except Exception:  # noqa: BLE001
+        prev_amt = None
+    ratio = (amt / prev_amt) if prev_amt else None
+    if ratio is not None:
+        lines.append(f"两市成交额 {amt / 1e8:.0f}亿(实时, 已过{elapsed:.0%}时段); "
+                     f"量能比(今日/昨日全天) = {ratio:.0%}")
+        if ratio > elapsed + 0.10:
+            vol_judge = "放量"
+        elif ratio < max(elapsed - 0.10, 0.05):
+            vol_judge = "缩量"
+        else:
+            vol_judge = "平量"
+    else:
+        lines.append(f"两市成交额 {amt / 1e8:.0f}亿(实时, 已过{elapsed:.0%}时段); 昨日成交额暂不可得")
+        vol_judge = "未知"
+
+    # ---- 昨日涨停池: 今日表现/晋级率/主线强弱 ----
+    pool_stat = {}
+    if pool is not None and len(pool):
+        try:
+            p = pool.copy()
+            p["代码"] = p["代码"].astype(str).str.zfill(6)
+            j = spot.merge(p[[c for c in ("代码", "名称", "连板数", "所属行业") if c in p.columns]],
+                           on="代码", how="inner", suffixes=("", "_池"))
+            j["连板数"] = pd.to_numeric(j.get("连板数"), errors="coerce").fillna(1)
+            up_n2 = int((j["涨跌幅"] > 0).sum())
+            lim_n = 0
+            for _, r in j.iterrows():
+                lim = classify_board(str(r["代码"]))["limit"]
+                if float(r["最新价"]) >= round(float(r["昨收"]) * (1 + lim / 100), 2) - 0.01:
+                    lim_n += 1
+            pool_stat = {
+                "n": len(j),
+                "red": up_n2 / len(j) if len(j) else 0,
+                "avg": float(j["涨跌幅"].mean()) if len(j) else 0,
+                "advance": lim_n / len(j) if len(j) else 0,
+                "height": int(j["连板数"].max()) if len(j) else 0,
+                "adv_n": lim_n,
+                "j": j,
+            }
+            lines.append(f"昨日涨停 {pool_stat['n']}只: 今日红盘率 {pool_stat['red']:.0%}, "
+                         f"平均 {pool_stat['avg']:+.2f}%, 晋级(再涨停) {lim_n}只 "
+                         f"= {pool_stat['advance']:.0%}, 最高 {pool_stat['height']}板")
+            if "所属行业" in j.columns:
+                g = (j.groupby("所属行业")
+                       .agg(只数=("代码", "count"), 今日均涨=("涨跌幅", "mean"))
+                       .sort_values("今日均涨", ascending=False))
+                hot = g.head(3)
+                parts = [f"{ind}({int(r['只数'])}只 {r['今日均涨']:+.1f}%)" for ind, r in hot.iterrows()]
+                if parts:
+                    lines.append("昨日主线今日强弱: " + " / ".join(parts))
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"(昨日涨停池分析失败: {e})")
+
+    # ---- 操作建议: 情绪 + 量能 + 晋级率 ----
+    advice = verdict
+    if pool_stat:
+        weak = pool_stat["advance"] < 0.30 or pool_stat["red"] < 0.45
+        strong = pool_stat["advance"] >= 0.50 and pool_stat["red"] >= 0.60
+        if weak and vol_judge == "缩量":
+            advice = "情绪偏弱+缩量+晋级率低: 建议降仓, 不接力高标, 只做确定性强的首板"
+        elif weak:
+            advice = "晋级率偏低: 控制仓位, 优先主线内低位首板, 避免追高连板"
+        elif strong and vol_judge == "放量":
+            advice = "放量+晋级率高: 可积极参与主线方向, 但仍需严格止损"
+        elif strong:
+            advice = "晋级率较高: 可做主线内的强势股, 注意量能是否配合"
+        else:
+            advice = "结构性行情: 只做主线板块内强势股, 控制单票仓位"
+    elif vol_judge == "缩量":
+        advice = verdict + "; 且量能不足, 建议减少操作频率"
+    return lines, advice
