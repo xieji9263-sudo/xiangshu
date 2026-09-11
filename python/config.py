@@ -32,7 +32,10 @@ MARKET = dict(
     # 注: N=上市首日, C=上市次日至第5日(次新); ST/退 由名称含 ST/退 判定;
     #     科创板未盈利后缀 "-U" 不在此剔除(其正常20cm交易, 交由下方市值/涨幅条件过滤)
     exclude_name_kw=("ST", "退", "N", "C"),
+    # 统计口径(情绪报告用): 仅剔除北交所
     exclude_prefix=("4", "8", "92"),               # 北交所代码前缀(43x/83x/87x/88x/920x)
+    # 选股口径(竞价池/尾盘候选用): 额外剔除创业板 —— 按你的要求
+    exclude_prefix_selection=("30", "4", "8", "92"),  # 30=创业板(300/301); 4/8/92=北交所
     # 跌停判定阈值近似（涨跌幅达到该负值视为跌停, 单位%）
     limit_pct_map={      # 涨跌幅上限口径, 仅用于情绪报告的近似统计
         "main": 10.0,    # 沪深主板(60/00) 10%
@@ -128,7 +131,7 @@ NOTIFY = dict(
     enable=True,                # 是否启用手机推送
     channels=["serverchan"],    # 启用的通道: serverchan/pushplus/wecom/email 任选
     wecom_key="",               # 企业微信群机器人 webhook 的 key(未用则留空)
-    serverchan_sendkey="",  # 密钥由 GitHub Secret 注入(NOTIFY_SERVERCHAN_KEY); 本地则直接填在此处
+    serverchan_sendkey="SCT415441TUGitIh9tt26YE2bcgFfJcqVc",  # Server酱 SENDKEY
     pushplus_token="",          # pushplus token(未用则留空)
     email=dict(
         host="",                # 例 smtp.qq.com
