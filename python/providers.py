@@ -266,6 +266,53 @@ def index_minute_frame(index_code, _date=None):
     return pd.DataFrame(recs)
 
 
+def index_prev_volume(index_code, _date=None):
+    """指数上一交易日成交量(手)。index_code: '000001'(沪) / '399106'(深综指)。"""
+    code = str(index_code)
+    if code.isdigit():
+        code = ("sz" if code.startswith("399") else "sh") + code
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,6,qfq"
+    raw = _retry(lambda: _get(url)).decode("utf-8", "ignore")
+    j = json.loads(raw)
+    node = (j.get("data") or {}).get(code) or {}
+    rows = node.get("qfqday") or node.get("day") or []
+    today = (_date or dt.date.today()).strftime("%Y-%m-%d")
+    prev = [r for r in rows if r and r[0] < today]
+    if not prev:
+        return None
+    try:
+        return float(prev[-1][5])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def index_prev_amount(index_code, _date=None):
+    """
+    指数上一交易日成交额(元)。优先用东财指数日线(含成交额); 失败返回 None。
+    index_code: 'sh000001'(沪) / 'sz399106'(深综指)
+    """
+    code = str(index_code)
+    if code.isdigit():
+        code = ("sz" if code.startswith("399") else "sh") + code
+    try:
+        import akshare as ak
+        df = _retry(lambda: ak.stock_zh_index_daily_em(symbol=code), tries=2)
+        if df is None or df.empty:
+            return None
+        col = "amount" if "amount" in df.columns else ("成交额" if "成交额" in df.columns else None)
+        if col is None:
+            return None
+        df = df.copy()
+        df["_d"] = pd.to_datetime(df["date"] if "date" in df.columns else df["日期"]).dt.strftime("%Y-%m-%d")
+        today = (_date or dt.date.today()).strftime("%Y-%m-%d")
+        prev = df[df["_d"] < today]
+        if prev.empty:
+            return None
+        return float(pd.to_numeric(prev.iloc[-1][col], errors="coerce"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # ------------------------------------------------------------------
 # 统一入口(供 common.get_spot 调用)
 # ------------------------------------------------------------------
