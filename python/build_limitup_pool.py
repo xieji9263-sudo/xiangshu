@@ -30,8 +30,22 @@ from notify import send_text, render_table
 
 
 def pool_digest(pool: pd.DataFrame) -> str:
-    """推送正文: 涨停家数 + 板块分布(编号, 含最高板)。"""
-    lines = [f"昨日涨停池: {len(pool)} 只 (已剔除ST/退市/北交)"]
+    """推送正文: 涨停家数 + 高标(含价格) + 板块分布。"""
+    lines = [f"昨日涨停池: {len(pool)} 只 (已剔除ST/退市/创业板/北交)"]
+    if len(pool):
+        top = pool.copy()
+        top["_n"] = pd.to_numeric(top.get("连板数"), errors="coerce").fillna(1)
+        top = top.sort_values("_n", ascending=False).head(6)
+        lines.append("")
+        lines.append("高标(连板数Top6, 含价格):")
+        for i, (_, r) in enumerate(top.iterrows(), 1):
+            star = "★ " if i == 1 else ""
+            px = r.get("最新价")
+            try:
+                px_s = f"{float(px):.2f}" if float(px) == float(px) else "-"
+            except Exception:  # noqa: BLE001
+                px_s = "-"
+            lines.append(f"{star}**{i}. {r['名称']}({r['代码']})** 价{px_s} · {int(r['_n'])}板")
     if "所属行业" in pool.columns and len(pool):
         g = pool.groupby("所属行业").agg(只数=("代码", "count"), 最高连板=("连板数", "max"))
         g = g.sort_values("只数", ascending=False).head(6)
@@ -41,7 +55,7 @@ def pool_digest(pool: pd.DataFrame) -> str:
             star = "★ " if i == 1 else ""
             lines.append(f"{star}**{i}. {ind}**: {int(r['只数'])}只 · 最高{int(r['最高连板'])}板")
     lines.append("")
-    lines.append("→ 明日 09:26 竞价扫描将基于本池自动推送候选。")
+    lines.append("→ 明日 09:25 竞价扫描将基于本池自动推送候选。")
     return "\n".join(lines)
 
 
