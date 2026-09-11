@@ -102,11 +102,12 @@ def test_classify():
     assert should_exclude("920001", "甲", config.MARKET)   # 北交前缀
     assert should_exclude("688001", "N新股", config.MARKET)  # N 新股
     assert not should_exclude("600001", "正常股", config.MARKET)
-    # 选股口径剔除创业板(300/301); 统计口径保留; 科创板保留
+    # 选股口径剔除创业板+北交+科创板; 统计口径只剔除北交, 保留创业板/科创板用于情绪家数
     assert should_exclude("300750", "宁德时代", config.MARKET)
     assert not should_exclude("300750", "宁德时代", config.MARKET, strict=False)
-    assert not should_exclude("688981", "中芯国际", config.MARKET)
-    return "板块/剔除规则一致(选股剔除创业板+北交)"
+    assert should_exclude("688981", "中芯国际", config.MARKET)              # 选股: 剔除
+    assert not should_exclude("688981", "中芯国际", config.MARKET, strict=False)  # 统计: 保留
+    return "板块/剔除规则一致(选股剔除创业板+科创板+北交)"
 
 
 def test_auction_compute():
@@ -119,8 +120,8 @@ def test_auction_compute():
         # 600002: 高开+1.6%(不足梅花2%), 竞价量40%(满足太子30%), 市值30亿 -> 梅=0, 太=1
         dict(代码="600002", 名称="乙", 今开=10.16, 昨收=10.0, 成交量=40000,
              换手率=0.8, 流通市值=30e8, 昨日量_手=100000, 量比=2.0),
-        # 600003: 竞价量不足(昨日量2%), 涨幅4% -> 梅=0, 太=0
-        dict(代码="600003", 名称="丙", 今开=10.4, 昨收=10.0, 成交量=2000,
+        # 600003: 竞价量不足(昨日量0.5%, 低于梅花2%与太子0.8%) -> 梅=0, 太=0
+        dict(代码="600003", 名称="丙", 今开=10.4, 昨收=10.0, 成交量=500,
              换手率=0.1, 流通市值=30e8, 昨日量_手=100000, 量比=1.0),
     ]
     r = compute(pd.DataFrame(rows))
@@ -130,6 +131,40 @@ def test_auction_compute():
     assert m["600002"] == 0 and t["600002"] == 1, (m, t)
     assert m["600003"] == 0 and t["600003"] == 0, (m, t)
     return f"梅={m} 太={t}"
+
+
+def test_emotion_official():
+    """情绪值应走官方量比口径: 旧口径(竞价量/昨全天量)量级仅0.01, 乘出来恒<1, 阈值10永不触发。"""
+    from auction_scan import compute
+    rows = [dict(代码="600001", 名称="甲", 今开=10.3, 昨收=10.0, 成交量=3000,
+                 换手率=1.2, 流通市值=10e8, 昨日量_手=100000, 量比=12.0)]
+    r = compute(pd.DataFrame(rows))
+    emo = float(r["情绪值"].iloc[0])
+    assert abs(emo - 1.2 * 12.0) < 1e-6, f"情绪值应为 换手1.2 x 量比12 = 14.4, 实际 {emo}"
+    return f"情绪值={emo:.1f}(官方量比口径)"
+
+
+def test_minute_high_after():
+    """回归: day_high 不得污染分钟最高时点(旧实现会让'尾盘创新高'恒为真)。"""
+    idx = pd.date_range("2025-01-06 09:30", "2025-01-06 15:00", freq="1min")
+    idx = idx[((idx.hour < 11) | ((idx.hour == 11) & (idx.minute <= 30)) | (idx.hour >= 13))]
+    n = len(idx)
+    price = [10.0] * n
+    price[5] = 10.5                       # 09:35 冲高后横盘
+    vol = [100] * n
+    mdf = pd.DataFrame({"时间": idx, "收盘": price, "最高": price, "最低": price,
+                        "成交量": vol, "成交额": [p * v * 100 for p, v in zip(price, vol)]})
+    met = minute_metrics(mdf, config.TAIL, None, day_high=10.5, day_low=9.9)
+    assert met["high_time"].startswith("09:3"), f"最高时点应在早盘, 实际 {met['high_time']}"
+    assert met["high_after"] is False, "尾盘创新高应为 False(旧实现恒为 True)"
+    assert met["high"] == 10.5, "day_high 只用于贴近新高与展示, 值应保留"
+    return f"最高时点={met['high_time']} 尾盘创新高={met['high_after']}"
+
+
+def test_backtest_offline():
+    """离线: 回测统计逻辑(命中判定/止盈止损优先级)。"""
+    from backtest import _self_test
+    return _self_test()
 
 
 def test_notify_helpers():
@@ -185,7 +220,10 @@ if __name__ == "__main__":
     check("尾盘 phase1 口径", test_filters)
     check("分钟线复核指标", test_minute_metrics)
     check("竞价 compute 口径", test_auction_compute)
+    check("情绪值官方量比口径", test_emotion_official)
+    check("分钟最高时点不受日高污染", test_minute_high_after)
     check("板块/剔除分类", test_classify)
+    check("回测统计逻辑(离线)", test_backtest_offline)
     check("通知模块(离线)", test_notify_helpers)
 
     print(f"\n结果: 通过 {len(PASS)} 项, 失败 {len(FAIL)} 项, 警告 {len(WARN)} 项")
