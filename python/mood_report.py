@@ -30,7 +30,7 @@ from notify import send_text
 def approx_limit_stats(spot: pd.DataFrame) -> dict:
     """按各板涨跌停价口径近似统计涨停/跌停家数(盘中会随封板/炸板变化)。"""
     s = spot.copy()
-    s = s[~s.apply(lambda r: should_exclude(r["代码"], r["名称"], config.MARKET), axis=1)]
+    s = s[~s.apply(lambda r: should_exclude(r["代码"], r["名称"], config.MARKET, strict=False), axis=1)]
     s = s[~s["名称"].apply(is_st_or_delist)]
     up = down = 0
     for _, r in s.iterrows():
