@@ -181,6 +181,26 @@ def spot_tencent_frame():
 # ------------------------------------------------------------------
 # 日K(前复权) -> 取 date_str 那天的成交量(手)
 # ------------------------------------------------------------------
+def daily_frame(code, n=200):
+    """
+    日K(前复权) DataFrame: 日期(YYYY-MM-DD) 开盘 收盘 最高 最低 成交量(手)
+    腾讯返回行: [日期, 开, 收, 高, 低, 成交量(手), ...]
+    """
+    sym = to_tencent_symbol(code)
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{n},qfq"
+    raw = _retry(lambda: _get(url)).decode("utf-8", "ignore")
+    j = json.loads(raw)
+    node = (j.get("data") or {}).get(sym, {})
+    rows = node.get("qfqday") or node.get("day") or []
+    recs = []
+    for r in rows:
+        if len(r) < 6:
+            continue
+        recs.append({"日期": r[0], "开盘": _num(r[1]), "收盘": _num(r[2]),
+                     "最高": _num(r[3]), "最低": _num(r[4]), "成交量": _num(r[5])})
+    return pd.DataFrame(recs)
+
+
 def prev_day_volume(code, date_str):
     """date_str 形如 '2025-02-28' 或 '20250228'。返回 (成交量手, 收盘价), 取不到返回 (None, None)。"""
     if "-" not in date_str:
@@ -233,13 +253,29 @@ def minute_frame(code, day_high=None, day_low=None, _date=None):
                          int(hm[:2]), int(hm[2:4]))
         recs.append({"时间": ts, "收盘": price, "最高": price, "最低": price,
                      "成交量": v, "成交额": a})
-    if recs:
-        if day_high is not None and day_high == day_high:
-            recs[-1]["最高"] = day_high
-        if day_low is not None and day_low == day_low:
-            recs[-1]["最低"] = day_low
     df = pd.DataFrame(recs)
+    # 重要: 不再把 day_high/day_low 写进最后一根。
+    # 旧实现会把"当日最高"强行写到末根, 导致任何基于 idxmax 的"最高出现时点"恒等于最后一根,
+    # "尾盘创新高"条件因此恒为真、完全失去筛选力(2026-09-11 修复)。
+    # 全日真实极值改由 df.attrs 传递, 仅用于"贴近新高"判定, 不参与时点定位。
+    if not df.empty:
+        df = _clip_trading_hours(df)
+    df.attrs["day_high"] = day_high
+    df.attrs["day_low"] = day_low
     return df
+
+
+def _clip_trading_hours(df: pd.DataFrame) -> pd.DataFrame:
+    """裁剪到连续竞价时段 09:30-15:00。
+
+    腾讯分钟接口会多返回一段 15:00-15:30 盘后固定价格交易数据(实测 267 根 vs 正常 242 根),
+    混入后会污染 vwap、5分钟脉冲与阶梯分桶的统计基数。
+    """
+    if df.empty or "时间" not in df.columns:
+        return df
+    ts = pd.to_datetime(df["时间"])
+    hm = ts.dt.strftime("%H:%M")
+    return df[(hm >= "09:30") & (hm <= "15:00")].reset_index(drop=True)
 
 
 def index_minute_frame(index_code, _date=None):
