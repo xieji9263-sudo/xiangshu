@@ -98,8 +98,12 @@ def spot_snapshot():
     return common.get_spot()
 
 
-def compute(df: pd.DataFrame) -> pd.DataFrame:
-    """对 池∩今日实时行情 的合并帧计算各竞价指标与两级命中, 返回带条件列的表。"""
+def compute(df: pd.DataFrame, open_mode: bool = False) -> pd.DataFrame:
+    """
+    对 池∩今日实时行情 的合并帧计算指标。
+    open_mode=False(9:25-9:30): 竞价口径 —— 情绪值 = 竞价换手% × 竞价量比
+    open_mode=True (9:30后):   开盘口径 —— 情绪值 = 换手% × 官方量比, 并给出涨停价/封板状态
+    """
     a = config.AUCTION
     out = df.copy()
 
@@ -114,13 +118,45 @@ def compute(df: pd.DataFrame) -> pd.DataFrame:
     out["竞价量缺失"] = ~(out["竞价量_手"] > 0)      # 接口未推送竞价量时 True
     out["竞价量比"] = out["竞价量_手"] / out["昨日量_手"].replace(0, float("nan"))
     out["竞价换手%"] = out["换手率"]
+    out["今日涨幅%"] = pd.to_numeric(out["涨跌幅"], errors="coerce")
     out["情绪值"] = out["竞价换手%"] * out["竞价量比"]
+
+    # 涨停价与封板状态(开盘模式用)
+    lims, ztp = [], []
+    for _, r in out.iterrows():
+        lim = common.classify_board(str(r["代码"]))["limit"]
+        lims.append(lim)
+        try:
+            ztp.append(round(float(r["昨收"]) * (1 + lim / 100), 2))
+        except Exception:  # noqa: BLE001
+            ztp.append(float("nan"))
+    out["_limit_pct"] = lims
+    out["涨停价"] = ztp
+
+    def _state(r):
+        try:
+            px, zt, hi = float(r["最新价"]), float(r["涨停价"]), float(r["最高"])
+        except Exception:  # noqa: BLE001
+            return ""
+        if px != px or zt != zt:
+            return ""
+        if px >= zt - 0.01:
+            return "封板"
+        if hi >= zt - 0.01:
+            return "炸板"
+        return ""
+
+    out["状态"] = out.apply(_state, axis=1) if open_mode else ""
 
     me = a["meihua"]
     m_cond = pd.Series(True, index=out.index)
     m_cond &= out["竞价涨幅%"].between(*me["gap"])
     # 竞价量/昨日量 缺失(接口限制)时不因缺数据误杀, 但会在表格里标注, 交由通达信复核
-    m_cond &= (out["竞价量比"] >= me["vol_ratio"]) | out["竞价量缺失"] | out["昨日量缺失"]
+    if open_mode:
+        # 开盘后"竞价量"口径失效, 用官方量比(>1)替代量能条件
+        m_cond &= pd.to_numeric(out.get("量比"), errors="coerce").fillna(0) >= 1
+    else:
+        m_cond &= (out["竞价量比"] >= me["vol_ratio"]) | out["竞价量缺失"] | out["昨日量缺失"]
     m_cond &= out["流通市值"] < me["float_mktcap_lt"]
     out["梅条件"] = m_cond
 
@@ -128,7 +164,10 @@ def compute(df: pd.DataFrame) -> pd.DataFrame:
     # 昨日涨幅(涨停池给的是涨停日涨幅>=涨停幅, 视为强势); 无法拿昨日涨幅时仅用池内股(涨停本身即强势)
     t_cond = pd.Series(True, index=out.index)
     t_cond &= out["竞价涨幅%"].between(*ta["gap"])
-    t_cond &= (out["竞价量比"] >= ta["vol_ratio"]) | out["竞价量缺失"] | out["昨日量缺失"]
+    if open_mode:
+        t_cond &= pd.to_numeric(out.get("量比"), errors="coerce").fillna(0) >= 1
+    else:
+        t_cond &= (out["竞价量比"] >= ta["vol_ratio"]) | out["竞价量缺失"] | out["昨日量缺失"]
     t_cond &= out["流通市值"] < ta["float_mktcap_lt"]
     out["太条件"] = t_cond
 
@@ -136,19 +175,96 @@ def compute(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def load_today_zt():
+    """今日涨停池(东财数据中心): 封板资金/首次封板/最后封板/炸板次数/连板数/所属行业。失败返回 None。"""
+    try:
+        import akshare as ak
+        df = common.fetch_retry(lambda: ak.stock_zt_pool_em(date=common.today_str()),
+                                retries=1, desc="今日涨停池")
+        if df is None or df.empty:
+            return None
+        df["代码"] = df["代码"].astype(str).str.zfill(6)
+        keep = [c for c in ("代码", "封板资金", "首次封板时间", "最后封板时间",
+                            "炸板次数", "连板数", "所属行业", "涨停统计") if c in df.columns]
+        return df[keep]
+    except Exception as e:  # noqa: BLE001
+        print(f"[提示] 今日涨停池获取失败({e}), 用行情自行判断封板状态")
+        return None
+
+
+def open_digest(res, board) -> str:
+    """9:35 开盘扫描推送: 可打板候选 + 高开强势 + 全池数据。"""
+    lines = []
+    n_board = 0 if board is None else len(board)
+    sealed = 0 if board is None else int((board["状态"] == "封板").sum())
+    broken = 0 if board is None else int((board["状态"] == "炸板").sum())
+    lines.append(f"昨日涨停池 {len(res)} 只 | 现涨停 {n_board} 只 (封板 {sealed} / 炸板 {broken})")
+
+    if board is not None and len(board):
+        lines.append("")
+        lines.append(f"◆ 可打板候选  ({len(board)} 只, 按连板数/封单排序)")
+        for i, (_, r) in enumerate(board.head(10).iterrows(), 1):
+            star = "★ " if i == 1 else ""
+            st = r.get("状态") or "接近涨停"
+            fd = r.get("封板资金")
+            try:
+                fd_s = f" 封单{float(fd)/1e8:.2f}亿" if float(fd) == float(fd) and float(fd) > 0 else ""
+            except Exception:  # noqa: BLE001
+                fd_s = ""
+            cn = r.get("_cn")
+            cn_s = f" {int(cn)}板" if cn == cn and cn is not None else ""
+            lines.append(f"{star}**{i}. {r['名称']}({r['代码']})** {st}{cn_s}{fd_s}")
+            lines.append(f"   现价{_fmt(r['最新价'], '{:.2f}')} | 涨{_fmt(r['今日涨幅%'], '{:.2f}')}%"
+                         f" | 量比{_fmt(r.get('量比'), '{:.2f}')} | 换手{_fmt(r['换手率'], '{:.2f}')}%"
+                         f" | 市值{_fmt(r['流通市值'] / 1e8, '{:.0f}')}亿")
+            ind = r.get("所属行业") or r.get("所属行业_今")
+            if isinstance(ind, str) and ind:
+                lines.append(f"   {ind}")
+    else:
+        lines.append("")
+        lines.append("◆ 可打板候选: 暂无(池内无封板/接近涨停标的)")
+
+    strong = res[(res["竞价涨幅%"] >= 2) & (~res["状态"].isin(["封板", "炸板"]))]
+    if len(strong):
+        lines.append("")
+        lines.append(f"◆ 高开强势(竞价涨幅≥2%, 未涨停)  {len(strong)} 只")
+        for i, (_, r) in enumerate(strong.sort_values("竞价涨幅%", ascending=False).head(8).iterrows(), 1):
+            lines.append(f"{i}. {r['名称']}({r['代码']}) 现价{_fmt(r['最新价'], '{:.2f}')}"
+                         f" | 竞价{_fmt(r['竞价涨幅%'], '{:.1f}')}% | 量比{_fmt(r.get('量比'), '{:.2f}')}"
+                         f" | 换手{_fmt(r['换手率'], '{:.2f}')}% | 市值{_fmt(r['流通市值'] / 1e8, '{:.0f}')}亿")
+
+    lines.append("")
+    lines.append(f"◆ 全池数据 ({len(res)} 只)")
+    for i, (_, r) in enumerate(res.sort_values("今日涨幅%", ascending=False).iterrows(), 1):
+        st = r.get("状态") or ""
+        lines.append(f"{i}. {r['名称']}({r['代码']}) 现价{_fmt(r['最新价'], '{:.2f}')}"
+                     f" 涨{_fmt(r['今日涨幅%'], '{:+.2f}')}% 量比{_fmt(r.get('量比'), '{:.2f}')}"
+                     f" 换手{_fmt(r['换手率'], '{:.2f}')}% 市值{_fmt(r['流通市值'] / 1e8, '{:.0f}')}亿"
+                     + (f" [{st}]" if st else ""))
+    lines.append("")
+    lines.append("→ 打板要点: 封板看封单/首封时间与是否反复开板; 竞价高开但量能不足者易冲高回落。")
+    lines.append("  非买入指令, 请人工复核压力位/公告/板块后独立决策。")
+    return "\n".join(lines)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="9:25-9:30 竞价扫描(一进二)")
+    ap = argparse.ArgumentParser(description="竞价/开盘扫描(池内一进二 + 可打板候选)")
     ap.add_argument("--pool-date", default=None, help="涨停池日期 YYYYMMDD(默认用 latest)")
     ap.add_argument("--force", action="store_true", help="时段外强制运行")
+    ap.add_argument("--open", action="store_true", help="开盘模式(9:30后): 可打板候选 + 全池数据")
+    ap.add_argument("--auction", action="store_true", help="强制竞价口径(9:25-9:30)")
     args = ap.parse_args()
 
     need_akshare()
     w0, w1 = config.AUCTION["window"]
     now_hm = common.hhmm_now()
-    if not (w0 <= now_hm <= w1) and not args.force:
+    open_mode = args.open or (now_hm >= "09:30" and not args.auction)
+    if not open_mode and not (w0 <= now_hm <= w1) and not args.force:
         print(f"[提示] 当前 {now_hm}, 建议窗口 {w0}-{w1}。之后运行会混入盘中量, 仅供研究。")
         print("       如确认要跑请加 --force")
         raise SystemExit(0)
+    if open_mode:
+        print(f"[开盘模式] 当前 {now_hm} (9:30后): 按开盘口径计算, 输出可打板候选 + 全池数据")
 
     print(f"[竞价扫描] {common.now_str()}")
     pool = load_latest_pool()
@@ -165,12 +281,37 @@ def main():
         print("[结果] 涨停池股票今日全部无行情(停牌?) —— 退出")
         return
 
-    res = compute(merged).sort_values("情绪值", ascending=False)
+    res = compute(merged, open_mode=open_mode).sort_values("情绪值", ascending=False)
 
     # 情绪值≥阈值 且 非竞价量缺失的池内股 → 关注池
     hot = res[res["情绪值"] >= config.AUCTION["emotion_threshold"]]
     meihua = res[res["梅条件"]]
     taizi = res[res["太条件"] & ~res["梅条件"]]
+
+    # 开盘模式(9:30后): 今日涨停池补充"封板资金/首封时间/炸板/连板"
+    zt_today = None
+    if open_mode:
+        zt_today = load_today_zt()
+        if zt_today is not None and len(zt_today):
+            res = res.merge(zt_today, on="代码", how="left", suffixes=("", "_今"))
+            print(f"[开盘模式] 今日涨停池 {len(zt_today)} 只已并入(封板资金/首封时间/连板)")
+        # 可打板候选: 封板或炸板, 或今日涨幅已接近涨停
+        near = res["今日涨幅%"] >= (res["_limit_pct"] - 1.2)
+        board = res[near | res["状态"].isin(["封板", "炸板"])].copy()
+        if "连板数_今" in board.columns:
+            board["_cn"] = pd.to_numeric(board["连板数_今"], errors="coerce").fillna(
+                pd.to_numeric(board.get("连板数"), errors="coerce"))
+        else:
+            board["_cn"] = pd.to_numeric(board.get("连板数"), errors="coerce").fillna(1)
+        if "封板资金" in board.columns:
+            board["_fd"] = pd.to_numeric(board["封板资金"], errors="coerce").fillna(0)
+        else:
+            board["_fd"] = 0
+        board = board.sort_values(["_cn", "_fd"], ascending=False)
+        print("\n================ 可打板候选(封板/接近涨停) ================")
+        _show(board, extra=("状态", "最新价", "今日涨幅%", "量比", "换手率", "_cn", "所属行业"))
+    else:
+        board = None
 
     print("\n================ 梅花剑命中(优先) ================")
     _show(meihua)
@@ -186,8 +327,13 @@ def main():
 
     # 手机推送(在 config.NOTIFY 启用后自动发出)
     if config.NOTIFY.get("enable"):
-        title = f"竞价扫描 {dt.datetime.now():%m-%d %H:%M} 梅{len(meihua)}/太{len(taizi)}/热{len(hot)}"
-        send_text(title, auction_digest(res, meihua, taizi, hot), attach_paths=[out_path])
+        if open_mode:
+            title = f"开盘扫描 {dt.datetime.now():%m-%d %H:%M} 池{len(res)}只 可打板{len(board)}只"
+            body = open_digest(res, board)
+        else:
+            title = f"竞价扫描 {dt.datetime.now():%m-%d %H:%M} 梅{len(meihua)}/太{len(taizi)}/热{len(hot)}"
+            body = auction_digest(res, meihua, taizi, hot)
+        send_text(title, body, attach_paths=[out_path])
     else:
         print("[notify] 未启用推送(设置 config.NOTIFY.enable=True 后可推到手机)")
 
