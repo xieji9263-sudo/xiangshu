@@ -2,3 +2,8 @@ output/
 __pycache__/
 *.pyc
 *.log
+
+# 本地密钥/私人配置(切勿提交)
+.env
+config_local.py
+*.key
