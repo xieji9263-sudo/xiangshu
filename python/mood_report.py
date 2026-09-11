@@ -66,8 +66,10 @@ def board_today_pool(today: str):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="盘前/盘后市场情绪与板块报告")
+    ap = argparse.ArgumentParser(description="盘前/午盘/收盘前市场情绪与操作建议")
     ap.add_argument("--no-pool", action="store_true", help="跳过涨停池相关统计")
+    ap.add_argument("--slot", default="auto", choices=["auto", "midday", "afternoon", "close"],
+                    help="推送场景: auto=按当前时间判断; midday=午盘; afternoon=收盘前")
     args = ap.parse_args()
 
     need_akshare()
@@ -96,6 +98,19 @@ def main():
 
     pool_metrics = {}
     pool = None if args.no_pool else load_pool()
+    if pool is None and not args.no_pool:
+        # 云端每次都是全新环境, 本地池文件通常不存在 -> 即时抓上一交易日涨停池(不补量, 很快)
+        try:
+            from build_limitup_pool import get_zt_pool
+            prev = common.prev_trading_date_str()
+            pool = get_zt_pool(prev)
+            pool["代码"] = pool["代码"].astype(str).str.zfill(6)
+            for _c, _d in (("连板数", 1), ("所属行业", "未知"), ("名称", "")):
+                if _c not in pool.columns:
+                    pool[_c] = _d
+            print(f"[池] 即时获取 {prev} 涨停池 {len(pool)} 只(未补量, 用于情绪/晋级分析)")
+        except Exception as e:  # noqa: BLE001
+            print(f"[池] 即时获取失败({e}), 本次跳过昨日涨停相关分析")
     if pool is not None and len(pool):
         pool["代码"] = pool["代码"].astype(str).str.zfill(6)
         j = spot.merge(pool[["代码", "名称", "连板数", "所属行业"]], on="代码", how="inner", suffixes=("", "_池"))
@@ -166,18 +181,27 @@ def main():
     row.update(pool_metrics)
     save_csv(pd.DataFrame([row]), out_path)
 
-    # 手机推送(在 config.NOTIFY 启用后自动发出)
+    # ---- 手机推送(含量能/昨日涨停晋级/操作建议) ----
     if config.NOTIFY.get("enable"):
-        body = [
-            f"上涨{up_n}/下跌{dn_n} 平盘{flat_n}, 上涨占比{red_rate:.1%}",
-            f"涨停≈{lim['涨停(近似)']}家 / 跌停≈{lim['跌停(近似)']}家",
-        ]
-        if pool_metrics:
-            body.append(f"昨涨停{pool_metrics['昨涨停数']}只 今日红盘率{pool_metrics['今日红盘率']:.1%} "
-                        f"平均{pool_metrics['今日平均涨幅']:.2f}% 最高{pool_metrics['最高连板']}板")
-        body.append(" / ".join(verdict))
-        body.append(">> " + advice)
-        send_text(f"情绪报告 {common.now_str()}", "\n".join(body), attach_paths=[out_path])
+        slot = args.slot
+        if slot == "auto":
+            if now_hm < "09:15":
+                slot = "盘前"
+            elif now_hm < "13:00":
+                slot = "午盘"
+            elif now_hm < "15:00":
+                slot = "收盘前"
+            else:
+                slot = "盘后"
+        else:
+            slot = {"midday": "午盘", "afternoon": "收盘前", "close": "盘后"}[slot]
+        ctx_lines, ctx_advice = common.market_context(spot, pool)
+        body = [f"【{slot}情绪·量能·操作建议】"] + ctx_lines
+        body.append("")
+        body.append(f"建议: {ctx_advice}")
+        body.append("(仅供参考, 非投资建议; 请结合压力位/公告自行判断)")
+        send_text(f"情绪报告·{slot} {dt.datetime.now():%m-%d %H:%M}", "\n".join(body),
+                  attach_paths=[out_path])
     else:
         print("[notify] 未启用推送(设置 config.NOTIFY.enable=True 后可推到手机)")
 
