@@ -58,7 +58,8 @@ def auction_digest(res, meihua, taizi, hot) -> str:
         lines.append("")
         lines.append(f"◆ {title}  ({len(sub)} 只)")
         for i, (_, r) in enumerate(t.loc[sub.index].head(cap).iterrows(), 1):
-            tail = [f"竞价{_fmt(r['竞价涨幅%'], '{:.1f}')}%",
+            tail = [f"现价{_fmt(r['最新价'], '{:.2f}')}",
+                    f"竞价{_fmt(r['竞价涨幅%'], '{:.1f}')}%",
                     f"量比{_fmt(r['竞价量比'], '{:.1f}')}",
                     f"换手{_fmt(r['竞价换手%'], '{:.2f}')}%",
                     f"市值{_fmt(r['市值亿'], '{:.0f}')}亿"]
