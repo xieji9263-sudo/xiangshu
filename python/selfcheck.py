@@ -102,7 +102,11 @@ def test_classify():
     assert should_exclude("920001", "甲", config.MARKET)   # 北交前缀
     assert should_exclude("688001", "N新股", config.MARKET)  # N 新股
     assert not should_exclude("600001", "正常股", config.MARKET)
-    return "板块/剔除规则一致"
+    # 选股口径剔除创业板(300/301); 统计口径保留; 科创板保留
+    assert should_exclude("300750", "宁德时代", config.MARKET)
+    assert not should_exclude("300750", "宁德时代", config.MARKET, strict=False)
+    assert not should_exclude("688981", "中芯国际", config.MARKET)
+    return "板块/剔除规则一致(选股剔除创业板+北交)"
 
 
 def test_auction_compute():
