@@ -60,7 +60,7 @@ def auction_digest(res, meihua, taizi, hot) -> str:
         for i, (_, r) in enumerate(t.loc[sub.index].head(cap).iterrows(), 1):
             tail = [f"现价{_fmt(r['最新价'], '{:.2f}')}",
                     f"竞价{_fmt(r['竞价涨幅%'], '{:.1f}')}%",
-                    f"量比{_fmt(r['竞价量比'], '{:.1f}')}",
+                    f"量比{_fmt(r.get('官方量比'), '{:.1f}')}",
                     f"换手{_fmt(r['竞价换手%'], '{:.2f}')}%",
                     f"市值{_fmt(r['市值亿'], '{:.0f}')}亿"]
             if show_emotion:
@@ -84,14 +84,28 @@ def auction_digest(res, meihua, taizi, hot) -> str:
     return "\n".join(lines)
 
 
-def load_latest_pool() -> pd.DataFrame:
+def load_latest_pool() -> tuple:
+    """
+    返回 (池DataFrame, 池日期str|None)。
+    池日期用于校验"这个池是不是上一交易日的"——用了过期池, 一进二的逻辑前提就不成立了。
+    """
     p = os.path.join(config.POOL["out_dir"], "limitup_pool_latest.csv")
     if not os.path.exists(p):
         print(f"[错误] 找不到 {p}\n       请先在收盘后运行: python build_limitup_pool.py")
         raise SystemExit(1)
     pool = common.load_csv(p)
     pool["代码"] = pool["代码"].astype(str).str.zfill(6)
-    return pool
+
+    pool_date = None
+    if "池日期" in pool.columns:
+        vals = [str(v).strip() for v in pool["池日期"].dropna().unique() if str(v).strip()]
+        if vals:
+            pool_date = vals[0]
+    if pool_date is None:
+        # 旧版池文件没有该列: 用文件修改时间兜底提示
+        print("[警告] 池文件缺少'池日期'列(旧格式), 无法校验是否过期; "
+              "请重跑 build_limitup_pool.py 生成新格式")
+    return pool, pool_date
 
 
 def spot_snapshot():
@@ -118,8 +132,24 @@ def compute(df: pd.DataFrame, open_mode: bool = False) -> pd.DataFrame:
     out["竞价量缺失"] = ~(out["竞价量_手"] > 0)      # 接口未推送竞价量时 True
     out["竞价量比"] = out["竞价量_手"] / out["昨日量_手"].replace(0, float("nan"))
     out["竞价换手%"] = out["换手率"]
-    out["今日涨幅%"] = pd.to_numeric(out["涨跌幅"], errors="coerce")
-    out["情绪值"] = out["竞价换手%"] * out["竞价量比"]
+    # 今日涨幅: 优先用行情涨跌幅列; 缺失时(合成测试/精简帧)用竞价涨幅兜底, 避免直接 KeyError
+    if "涨跌幅" in out.columns:
+        out["今日涨幅%"] = pd.to_numeric(out["涨跌幅"], errors="coerce")
+    else:
+        out["今日涨幅%"] = out["竞价涨幅%"]
+    # 情绪值口径(2026-09-11 修正):
+    #   旧 = 竞价换手% × (竞价量/昨日全天量)。后者量级 0.01 上下, 乘积恒 <1,
+    #        而阈值是 10 —— 实测几乎不可能触发, 关注池长期为空。
+    #   新 = 竞价换手% × 官方量比(行情"量比"列)。竞价时段量比量级 1~30,
+    #        与框架示例"换手1% × 量比12倍 = 12"自洽。
+    #   "竞价量/昨日量"仍保留在 竞价量比 列, 专供梅/太的 vol_ratio 条件使用。
+    official = pd.to_numeric(out.get("量比"), errors="coerce")
+    out["官方量比"] = official
+    out["情绪值缺失"] = official.isna() | (official <= 0)
+    if config.AUCTION.get("emotion_use_official_volratio", True):
+        out["情绪值"] = out["竞价换手%"] * official.where(official > 0)
+    else:
+        out["情绪值"] = out["竞价换手%"] * out["竞价量比"]
 
     # 涨停价与封板状态(开盘模式用)
     lims, ztp = [], []
@@ -267,9 +297,21 @@ def main():
         print(f"[开盘模式] 当前 {now_hm} (9:30后): 按开盘口径计算, 输出可打板候选 + 全池数据")
 
     print(f"[竞价扫描] {common.now_str()}")
-    pool = load_latest_pool()
+    pool, pool_date = load_latest_pool()
     spot = spot_snapshot()
-    print(f"[数据] 昨日涨停池 {len(pool)} 只; 全市场行情 {len(spot)} 只")
+    print(f"[数据] 昨日涨停池 {len(pool)} 只(池日期 {pool_date or '未知'}); 全市场行情 {len(spot)} 只")
+
+    # 过期池校验: 池不是上一交易日的, 说明没及时建池, 一进二的"昨日涨停"前提不成立
+    stale = False
+    if pool_date:
+        expect = common.prev_trading_date_str()
+        if pool_date != expect:
+            stale = True
+            print(f"[警告] 涨停池日期 {pool_date} ≠ 上一交易日 {expect}")
+            print("       该池已过期, 一进二语义失效! 请先运行: python build_limitup_pool.py")
+            if not args.force:
+                print("       如确需继续(仅供研究)请加 --force")
+                raise SystemExit(0)
 
     # 只保留池内(昨涨停)股票做一进二; 太子剑同样以池为基础(宽松覆盖昨强势由池内高标体现)
     keep_cols = set(pool.columns) & {"代码", "名称", "所属行业", "连板数", "昨日量_手", "昨收", "涨停统计", "换手率"}
@@ -287,6 +329,9 @@ def main():
     hot = res[res["情绪值"] >= config.AUCTION["emotion_threshold"]]
     meihua = res[res["梅条件"]]
     taizi = res[res["太条件"] & ~res["梅条件"]]
+    n_miss = int(res["情绪值缺失"].sum()) if "情绪值缺失" in res.columns else 0
+    if n_miss:
+        print(f"[提示] {n_miss} 只未返回量比, 情绪值记为空(不进关注池), 这类票请直接看梅/太命中")
 
     # 开盘模式(9:30后): 今日涨停池补充"封板资金/首封时间/炸板/连板"
     zt_today = None
@@ -327,11 +372,12 @@ def main():
 
     # 手机推送(在 config.NOTIFY 启用后自动发出)
     if config.NOTIFY.get("enable"):
+        tag = "[池过期] " if stale else ""
         if open_mode:
-            title = f"开盘扫描 {dt.datetime.now():%m-%d %H:%M} 池{len(res)}只 可打板{len(board)}只"
+            title = f"{tag}开盘扫描 {dt.datetime.now():%m-%d %H:%M} 池{len(res)}只 可打板{len(board)}只"
             body = open_digest(res, board)
         else:
-            title = f"竞价扫描 {dt.datetime.now():%m-%d %H:%M} 梅{len(meihua)}/太{len(taizi)}/热{len(hot)}"
+            title = f"{tag}竞价扫描 {dt.datetime.now():%m-%d %H:%M} 梅{len(meihua)}/太{len(taizi)}/热{len(hot)}"
             body = auction_digest(res, meihua, taizi, hot)
         send_text(title, body, attach_paths=[out_path])
     else:
@@ -344,7 +390,7 @@ def main():
     print("       (命中股较多时, 优先 连板数低+市值小+所属行业为当下主线的标的)")
 
 
-def _show(df: pd.DataFrame, extra=("情绪值", "竞价涨幅%", "竞价量比", "竞价换手%", "流通市值(亿)", "连板数", "所属行业")):
+def _show(df: pd.DataFrame, extra=("情绪值", "竞价涨幅%", "官方量比", "竞价量比", "竞价换手%", "流通市值(亿)", "连板数", "所属行业")):
     if df.empty:
         print("  (空)")
         return
