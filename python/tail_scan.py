@@ -69,7 +69,13 @@ def tail_digest(res, spot) -> str:
                     marks.append(lab)
             high = r.get("最高时间")
             if isinstance(high, str) and high and high != "nan":
-                marks.append(f"新高{high}")
+                marks.append(f"新高{high}(近似)")
+            ex = r.get("超额收益%")
+            try:
+                if ex == ex and ex is not None:
+                    marks.append(f"超额{float(ex):+.1f}%")
+            except Exception:  # noqa: BLE001
+                pass
             if marks:
                 lines.append("   " + " · ".join(marks))
     else:
@@ -163,7 +169,9 @@ def main():
         code, name = r["代码"], r["名称"]
         try:
             mdf = minute_of(code, r["最高"], r["最低"])
-            met = minute_metrics(mdf, cfg_tail, index_df)
+            # day_high 只用于"贴近新高"判定, 不参与最高时点定位(否则尾盘创新高恒真)
+            met = minute_metrics(mdf, cfg_tail, index_df,
+                                 day_high=r["最高"], day_low=r["最低"])
         except Exception as e:  # noqa: BLE001
             print(f"  [警告] {code} {name} 分钟复核失败: {e}")
             continue
@@ -181,6 +189,7 @@ def main():
             "阶梯温和": "Y" if met.get("ladder_ok") else ("?" if met.get("ladder_ok") is None else ""),
             "无脉冲": "Y" if met.get("spike_ok") else "",
             "跑赢大盘%": met.get("beat_index_frac"),
+            "超额收益%": met.get("超额收益%"),
             "跑赢大盘": "Y" if met.get("beat_index_ok") else "",
             "收盘价": met.get("last"),
         }
