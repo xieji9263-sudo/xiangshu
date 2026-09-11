@@ -128,6 +128,8 @@ def main():
     if config.POOL.get("enrich_prev_volume", True):
         pool = enrich_prev_volume(pool, date_str)
 
+    # 记录池日期: 竞价扫描靠它校验"池是不是上一交易日的", 过期池会让一进二语义失效
+    pool["池日期"] = date_str
     out_path = os.path.join(config.POOL["out_dir"], f"limitup_pool_{date_str}.csv")
     save_csv(pool, out_path)
     # 同时生成"最新"软链接式副本, 供其它脚本免传参读取
