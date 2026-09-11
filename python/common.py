@@ -154,8 +154,8 @@ def is_st_or_delist(name: str) -> bool:
 def should_exclude(code: str, name: str, cfg_market: dict, strict: bool = True) -> bool:
     """
     是否应剔除。
-    strict=True  (选股口径, 默认): ST/退市/新股(N,C) + 北交所 + 创业板(300/301)
-    strict=False (统计口径):        ST/退市/新股(N,C) + 北交所(保留创业板, 用于情绪家数统计)
+    strict=True  (选股口径, 默认): ST/退市/新股(N,C) + 北交所 + 创业板(300/301) + 科创板(688)
+    strict=False (统计口径):        ST/退市/新股(N,C) + 北交所(保留创业板/科创板, 用于情绪家数统计)
     """
     kw = cfg_market.get("exclude_name_kw", ())
     up = str(name or "").upper()
@@ -166,6 +166,11 @@ def should_exclude(code: str, name: str, cfg_market: dict, strict: bool = True) 
                          cfg_market.get("exclude_prefix", ()))
     if any(code.startswith(p) for p in pre):
         return True
+    # 科创板 688/689 是 20cm 板: 同样的"涨3-5%/换手5-10%"在 20cm 与 10cm 板上含义完全不同,
+    # 混在主板口径里会污染筛选。选股口径默认剔除, 需要保留请在 config 里关掉。
+    if strict and cfg_market.get("exclude_star_in_selection", True):
+        if code.startswith(("688", "689")):
+            return True
     return False
 
 
@@ -228,16 +233,29 @@ def _t(x):
         return pd.to_datetime(x)
     return pd.Timestamp(x)
 
-def minute_metrics(mdf: pd.DataFrame, cfg_tail: dict, index_mdf: pd.DataFrame = None) -> dict:
+def _clip_trading_hours(df: pd.DataFrame) -> pd.DataFrame:
+    """只保留连续竞价时段 09:30-15:00 的分钟(剔除盘后固定价格交易段的干扰数据)。"""
+    if df is None or len(df) == 0 or "时间" not in df.columns:
+        return df
+    ts = pd.to_datetime(df["时间"])
+    hm = ts.dt.strftime("%H:%M")
+    return df[(hm >= "09:30") & (hm <= "15:00")].reset_index(drop=True)
+
+
+def minute_metrics(mdf: pd.DataFrame, cfg_tail: dict, index_mdf: pd.DataFrame = None,
+                   day_high: float = None, day_low: float = None) -> dict:
     """
     对单只股票的当日分钟线计算尾盘复核指标, 返回 dict。
     index_mdf: 基准指数当日分钟线(含 时间/收盘), 用于"分时跑赢大盘"。
+    day_high/day_low: 日频真实最高/最低(来自实时快照)。只用于"贴近新高"判定,
+                      绝不写回分钟序列——否则"当日最高时点"会恒等于最后一根。
     全部为近似统计, 用于初筛后的人工确认, 不是精确交易信号。
     """
     out = {}
     m = mdf.copy()
     m["_t"] = pd.to_datetime(m["时间"] if "时间" in m.columns else m["datetime"])
     m = m[m["_t"].dt.date == m["_t"].dt.date.iloc[0]].reset_index(drop=True)
+    m = _clip_trading_hours(m)
     out["n_minutes"] = int(len(m))
 
     # --- 分时均价线与回踩判断 ---
@@ -246,7 +264,8 @@ def minute_metrics(mdf: pd.DataFrame, cfg_tail: dict, index_mdf: pd.DataFrame = 
     vwap = (cum_amt / (cum_vol * 100)).replace([float("inf")], float("nan"))
     out["vwap"] = float(vwap.iloc[-1]) if len(vwap) and pd.notna(vwap.iloc[-1]) else float("nan")
     out["last"] = float(m["收盘"].iloc[-1]) if len(m) else float("nan")
-    out["high"] = float(m["最高"].max()) if len(m) else float("nan")
+    out["high"] = (float(day_high) if (day_high is not None and day_high == day_high)
+                   else (float(m["最高"].max()) if len(m) else float("nan")))
     conf = cfg_tail.get("confirm", {})
     if out["vwap"] == out["vwap"] and out["last"] == out["last"]:
         out["above_vwap"] = bool(out["last"] >= out["vwap"]) if conf.get("above_vwap", True) else None
@@ -258,10 +277,13 @@ def minute_metrics(mdf: pd.DataFrame, cfg_tail: dict, index_mdf: pd.DataFrame = 
         out["near_high"] = None
 
     # --- 当日最高出现时点 ---
+    # 注意: 腾讯分钟只给每分钟一个价格, 无真实分时极值, 因此"最高时点"是分钟价格序列的近似。
+    # 若日频真实最高(day_high)明显高于分钟序列最高, 说明极值出现在某一分钟内部, 时点会有误差。
     hi_t = m.loc[m["最高"].astype(float).idxmax(), "_t"]
     out["high_time"] = hi_t.strftime("%H:%M:%S")
     ha = conf.get("high_after", "14:25")
     out["high_after"] = bool(hi_t.strftime("%H:%M") >= ha)
+    out["high_time_approx"] = True
 
     # --- 阶梯式温和放大: 4 桶每分钟均量(时钟桶; early=早盘模式按已有时段四分位近似) ---
     vol = m["成交量"].astype(float)
@@ -312,7 +334,12 @@ def minute_metrics(mdf: pd.DataFrame, cfg_tail: dict, index_mdf: pd.DataFrame = 
             ret_i = merged["收盘_ix"] / merged["收盘_ix"].iloc[0] - 1
             frac = float((ret_s >= ret_i).mean())
             out["beat_index_frac"] = round(frac, 3)
-            out["beat_index_ok"] = bool(frac >= cfg_tail.get("beat_index", {}).get("min_frac", 0.9))
+            # 超额收益: 初筛已选涨3-5%的票, 单看"分钟占比"几乎恒真, 必须叠加绝对超额门槛
+            excess = float((ret_s.iloc[-1] - ret_i.iloc[-1]) * 100)
+            out["超额收益%"] = round(excess, 2)
+            bi = cfg_tail.get("beat_index", {})
+            out["beat_index_ok"] = bool(frac >= bi.get("min_frac", 0.9)
+                                        and excess >= bi.get("min_excess", 0.0))
     return out
 
 
@@ -367,14 +394,43 @@ def market_mood_block(spot: pd.DataFrame) -> tuple:
     return block, verdict
 
 
-def prev_trading_date_str() -> str:
-    """上一交易日(仅跳周末; 节假日取到的日期无涨停池时表现为空池, 属正常)。"""
-    d = dt.date.today()
+_TRADING_DATES = None
+
+
+def trade_dates():
+    """交易日历(升序 YYYYMMDD 列表)。首次调用后缓存; 接口不可用返回 None。"""
+    global _TRADING_DATES
+    if _TRADING_DATES is not None:
+        return _TRADING_DATES
+    if HAS_AKSHARE:
+        try:
+            df = ak.tool_trade_date_hist_sina()
+            d = sorted(pd.to_datetime(df["trade_date"]).dt.strftime("%Y%m%d").tolist())
+            if d:
+                _TRADING_DATES = d
+                return d
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
+def prev_trading_date_str(ref: dt.date = None) -> str:
+    """
+    上一交易日。优先用交易日历(覆盖节假日/调休);
+    接口不可用才退化为"向前找工作日"(遇春节国庆会取错, 调用方应做空池兜底)。
+    """
+    d = ref or dt.date.today()
+    dates = trade_dates()
+    if dates:
+        ds = d.strftime("%Y%m%d")
+        prev = [x for x in dates if x < ds]
+        if prev:
+            return prev[-1]
     for _ in range(10):
         d -= dt.timedelta(days=1)
         if d.weekday() < 5:
             return d.strftime("%Y%m%d")
-    return d.strftime("%Y%m%d")
+    return dt.date.today().strftime("%Y%m%d")
 
 
 def trading_elapsed_fraction(now=None) -> float:
