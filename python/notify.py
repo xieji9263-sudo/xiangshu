@@ -173,6 +173,10 @@ def send_text(title, content, attach_paths=None) -> dict:
     if not n.get("enable"):
         print("[notify] 未启用(把 config.NOTIFY.enable 设为 True 并配置通道后生效)")
         return {}
+    if os.environ.get("NOTIFY_SILENT", "").strip() in ("1", "true", "True", "yes"):
+        # 本地验证用: NOTIFY_SILENT=1 时只打印不真发, 避免反复打扰手机
+        print(f"[notify] 静音模式(不发送): {title}")
+        return {"silent": "skipped"}
     results = {}
     for ch in n.get("channels", []):
         fn = _CHANNEL_FN.get(ch)
