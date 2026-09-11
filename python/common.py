@@ -151,14 +151,20 @@ def is_st_or_delist(name: str) -> bool:
     name = str(name or "")
     return ("ST" in name.upper()) or ("退" in name)
 
-def should_exclude(code: str, name: str, cfg_market: dict) -> bool:
-    """是否应剔除: ST/退市/新股代码(N,C开头)/北交所前缀/特征前缀。"""
+def should_exclude(code: str, name: str, cfg_market: dict, strict: bool = True) -> bool:
+    """
+    是否应剔除。
+    strict=True  (选股口径, 默认): ST/退市/新股(N,C) + 北交所 + 创业板(300/301)
+    strict=False (统计口径):        ST/退市/新股(N,C) + 北交所(保留创业板, 用于情绪家数统计)
+    """
     kw = cfg_market.get("exclude_name_kw", ())
     up = str(name or "").upper()
     if any(up.startswith(k) for k in kw):
         return True
     code = str(code).zfill(6)
-    if any(code.startswith(p) for p in cfg_market.get("exclude_prefix", ())):
+    pre = cfg_market.get("exclude_prefix_selection" if strict else "exclude_prefix",
+                         cfg_market.get("exclude_prefix", ()))
+    if any(code.startswith(p) for p in pre):
         return True
     return False
 
@@ -337,7 +343,7 @@ def market_mood_block(spot: pd.DataFrame) -> tuple:
     mkt = _cfg.MARKET
     for _, r in spot.iterrows():
         code, nm = str(r["代码"]), str(r.get("名称", ""))
-        if should_exclude(code, nm, mkt) or is_st_or_delist(nm):
+        if should_exclude(code, nm, mkt, strict=False) or is_st_or_delist(nm):
             continue
         lim = classify_board(code)["limit"]
         try:
